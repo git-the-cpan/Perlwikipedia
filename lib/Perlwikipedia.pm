@@ -3,13 +3,14 @@ package Perlwikipedia;
 use strict;
 use WWW::Mechanize;
 use HTML::Entities;
+use URI::Escape;
 use XML::Simple;
 use Carp;
 use Encode;
 use URI::Escape qw(uri_escape_utf8);
 use MediaWiki::API;
 
-our $VERSION = '1.3.0';
+our $VERSION = '1.3.2_01';
 
 =head1 NAME
 
@@ -147,10 +148,11 @@ set_wiki will cause the Perlwikipedia object to use the wiki specified, e.g set_
 
 sub set_wiki {
     my $self = shift;
-    my $host = shift;
-    my $path = shift;
+    my $host = shift || 'en.wikipedia.org';
+    my $path = shift || 'w';
     $self->{host} = $host if $host;
     $self->{path} = $path if $path;
+    $self->{api}->{config}->{api_url} = "http://$host/$path/api.php";
     print "Wiki set to http://$self->{host}/$self->{path}\n" if $self->{debug};
     return 0;
 }
@@ -183,33 +185,19 @@ sub login {
         }
     }
 
-    my $res = $self->_put(
-        'Special:Userlogin',
-        {
-            form_name => 'userlogin',
-            fields    => {
-                wpName     => $editor,
-                wpPassword => $password,
-                wpRemember => 1,
-            },
-        }
-    );
-    $self->{api}->{ua}->{cookie_jar} = $self->{mech}->{cookie_jar};
-    unless (ref($res) eq 'HTTP::Response' && $res->is_success) { return; }
-    my $content = $res->decoded_content();
-    if ( $content =~ m/var wgUserName = "$editor"/ ) {
-        print qq/Login as "$editor" succeeded.\n/ if $self->{debug};
-        return 0;
+	my $res = $self->{api}->api( {
+		action=>'login',
+		lgname=>$editor,
+		lgpassword=>$password } );
+#	use Data::Dumper; print Dumper($res);
+#    unless (ref($res) eq 'HTTP::Response' && $res->is_success) { return; }
+
+    $self->{mech}->{cookie_jar} = $self->{api}->{ua}->{cookie_jar};
+    my $result = $res->{login}->{result};
+    if ($result eq "Success") {
+	return 0;
     } else {
-        if ( $content =~ m/There is no user by the name/ ) {
-            $self->{errstr} = qq/Login as "$editor" failed: User "$editor" does not exist/;
-        } elsif ( $content =~ m/Incorrect password entered/ ) {
-            $self->{errstr} = qq/Login as "$editor" failed: Bad password/;
-        } elsif ( $content =~ m/Password entered was blank/ ) {
-            $self->{errstr} = qq/Login as "$editor" failed: Blank password/;
-        }
-		carp $self->{errstr} if $self->{debug};
-		return 1;
+	return 1;
     }
 }
 
@@ -229,19 +217,20 @@ sub edit {
     my $res;
 
     $assert=~s/\&?assert=// if $assert;
-    $text = encode( 'utf8', $text ) if $text;
-    $summary = encode( 'utf8', $summary ) if $summary;
-
+#    $text = encode( 'utf8', $text ) if $text;
+#    $summary = encode( 'utf8', $summary ) if $summary;
 
 	$res = $self->{api}->api( {
 		action=>'query',
 		titles=>$page,
 		prop=>'info|revisions',
 		intoken=>'edit' } );
+#	use Data::Dumper; print Dumper($res);
 	my ($id, $data)=%{$res->{query}->{pages}};
 	my $edittoken=$data->{edittoken};
 	my $lastedit=$data->{revisions}[0]->{timestamp};
-	$res = $self->{api}->api( {
+
+	my $savehash = {
 		action=>'edit',
 		title=>$page,
 		token=>$edittoken,
@@ -249,14 +238,23 @@ sub edit {
 		summary=>$summary,
 		minor=>$is_minor,
 		basetimestamp=>$lastedit,
-		assert=>$assert } );
-	if ($res->{edit}->{result} eq 'Failure') {
+		bot=>1};
+
+	$savehash->{assert}=$assert if ($assert);
+#	use Data::Dumper; print Dumper($savehash);
+
+	$res = $self->{api}->api( $savehash );
+#	use Data::Dumper; print Dumper($res);
+	if (!$res) {carp "API returned null result for edit"}
+	if ($res->{edit}->{result} && $res->{edit}->{result} eq 'Failure') {
 	        print "edit failed as ".$self->{mech}->{agent}."\n";
 		if ($self->{operator}) {
 			print "Operator is $self->{operator}\n";
-		        unless ($self->get_text("User talk:$self->{operator}")=~/Error with \Q$self->{mech}->{agent}\E/) {
+			my $optalk=$self->get_text("User talk:".$self->{operator});
+		        unless ($optalk=~/Error with \Q$self->{mech}->{agent}\E/) {
 				print "Sending warning!\n";
-				$self->edit("User talk:$self->{operator}", $self->get_text("User talk:$self->{operator}")."\n\n==Error with $self->{agent}==\n$self->{agent} needs to be logged in! ~~~~", '', 0, 'assert=');
+				$self->edit("User talk:$self->{operator}", $optalk."\n\n==Error with ".$self->{mech}->{agent}."==\n".$self->{mech}->{agent}." needs to be logged in! ~~~~", 'bot issue', 0, 'assert=');
+
 			}
 		}
 		return 2;
@@ -336,31 +334,25 @@ sub get_text {
     my $recurse  = shift || 0;
     my $dontescape=shift || 0;
 
-    my $wikitext = '';
-    my $res;
+	my $hash = {
+		action=>'query',
+		titles=>$pagename,
+		prop=>'revisions',
+		rvprop=>'content',
+	};
 
-    $res = $self->_get( $pagename, 'edit', "&oldid=$revid&section=$section", $dontescape );
-    unless (ref($res) eq 'HTTP::Response' && $res->is_success) { return 1; }
-    if ($recurse) {
-    	until ( ref($res) eq 'HTTP::Response' && $res->is_success && $res->decoded_content =~ m/var wgAction = "edit"/ ) {
-    	    my $real_title;
-    	    if ( $res->decoded_content =~ m/var wgTitle = "(.+?)"/ ) {
-    	        $real_title = $1;
-    	    }
-    	    $res = $self->_get( $real_title, 'edit' );
-    	}
-    }
-    if ( $res->decoded_content =~ /<textarea.+?\s?>(.{2,})<\/textarea>/s ) {
-		$wikitext = $1;
-    } elsif ( $res->decoded_content =~ /div class="mw-newarticletext"/ or $res->decoded_content=~/div class="permissions-errors".+id="noarticletext"/) {
-		return 2;
-    } else {
-    	$self->{errstr} = "Could not get_text for $pagename";
-        carp $self->{errstr} if $self->{debug};
-		return 1;
-    }
+	$hash->{rvsection}=$section if ($section);
+	$hash->{rvstartid}=$revid if ($revid);
 
-	return decode_entities($wikitext);
+	my $res = $self->{api}->api( $hash );
+#	use Data::Dumper; print Dumper($res);
+	my ($id, $data)=%{$res->{query}->{pages}};
+
+	if ($id==-1) {return 2}
+
+	my $wikitext=$data->{revisions}[0]->{'*'};
+#	use Data::Dumper;print Dumper($data);
+	return $wikitext;
 }
 
 =item revert($pagename,$edit_summary,$old_revision_id)
@@ -510,52 +502,19 @@ sub get_pages_in_category {
     my $self     = shift;
     my $category = shift;
 
-    my @pages;
-    my $res = $self->_get( $category, 'view' );
-    unless (ref($res) eq 'HTTP::Response' && $res->is_success) { return 1; }
-    my $content = $res->decoded_content;
-    if ($content=~/<div id=\"mw-subcategories\">/i) {
-        $content=~s/.+<div id=\"mw-subcategories\">//is;
-        while ( $content =~ m{href="(?:[^"]+)/Category:[^"]+">([^<]*)</a></div>}ig )
-        {
-            push @pages, 'Category:' . $1;
-        }
-    }
-    if ($content=~/<div id=\"mw-pages\">/i) {
-	$content=~s/.+<div id=\"mw-pages\">//is;
-        while ( $content =~
-            m{<li><a href="(?:[^"]+)" title="([^"]+)">[^<]*</a></li>}ig ) {
-            push @pages, $1;
-        }
-        while ( $content =~
-            m{<div class="gallerytext">\n<a href="[^"]+" title="([^"]+)">[^<]+</a>}ig ) {
-            push @pages, $1;
-        }
-    }
-    while ( ($res = $self->{mech}->follow_link( text => 'next 200' ))  && ref($res) eq 'HTTP::Response' && $res->is_success) {
-        sleep 1;    #Cheap hack to make sure we don't bog down the server
-        $content = $res->decoded_content();
+    my @return;
+	my $res = $self->{api}->list( {
+		action=>'query',
+		list=>'categorymembers',
+		cmtitle=>$category,
+		aplimit=>500 },
+#		{ max=>100 }
+		 );
 
-    if ($content=~/<div id=\"mw-subcategories\">/i) {
-        $content=~s/.+<div id=\"mw-subcategories\">//is;
-        while ( $content =~ m{href="(?:[^"]+)/Category:[^"]+">([^<]*)</a></div>}ig )
-        {
-            push @pages, 'Category:' . $1;
-        }
-    }
-    if ($content=~/<div id=\"mw-pages\">/i) {
-	$content=~s/.+<div id=\"mw-pages\">//is;
-        while ( $content =~
-            m{<li><a href="(?:[^"]+)" title="([^"]+)">[^<]*</a></li>}ig ) {
-            push @pages, $1;
-        }
-        while ( $content =~
-            m{<div class="gallerytext">\n<a href="[^"]+" title="([^"]+)">[^<]+</a>}ig ) {
-            push @pages, $1;
-        }
-    }
-    }
-    return @pages;
+	foreach (@{$res}) {
+		push @return, $_->{title};
+	}
+	return @return;
 }
 
 =item get_all_pages_in_category($category_name)
@@ -692,9 +651,10 @@ sub test_image_exists {
 	my $page	= shift;
 
 	my $res = $self->_get($page);
+#	print $res->decoded_content."\n";
 	if ($res->decoded_content=~/No file by this name exists/i) {
 	return 0;
-	} elsif ($res->decoded_content=~/This is a file from the \<a href=.+commons:Main_Page"\>Wikimedia Commons/is) {
+	} elsif ($res->decoded_content=~/This is a file from the \<a href=.+commons:Main[\s_]Page"\>Wikimedia Commons/is) {
 	return 2;
 	} else {
 	return 1;
@@ -711,14 +671,21 @@ sub delete_page {
 	my $self	= shift;
 	my $page	= shift;
 	my $summary = shift;
-	my $res	 = $self->_get( $page, 'delete' );
-	unless ($res) { return; }
-	my $options = {
-		   fields	=> {
-				wpReason  => $summary,
-			},
-		};
-	$res = $self->{mech}->submit_form( %{$options});
+
+
+	my $res = $self->{api}->api( {
+		action=>'query',
+		titles=>$page,
+		prop=>'info|revisions',
+		intoken=>'delete' } );
+	my ($id, $data)=%{$res->{query}->{pages}};
+	my $edittoken=$data->{deletetoken};
+	$res = $self->{api}->api( {
+		action=>'delete',
+		title=>$page,
+		token=>$edittoken,
+		reason=>$summary } );
+
 	return $res;
 }
 
@@ -765,19 +732,26 @@ sub block {
 	my $blockemail=shift;
 	my $res	 = $self->_get( "Special:Blockip/$user" );
 	unless ($res) { return; }
-	my $options = {
-		   fields	=> {
-				wpBlockAddress  => $user,
-				wpBlockExpiry  => 'other',
-				wpAnonOnly  => $anononly,
-				wpCreateAccount => $blockac,
-				wpEnableAutoblock => $autoblock,
-				wpEmailBan => $blockemail,
-				wpBlockReason  => $summary,
-				wpBlockOther  => $length,
-			},
-		};
-	$res = $self->{mech}->submit_form( %{$options});
+
+	$res = $self->{api}->api( {
+		action=>'query',
+		titles=>'Main_Page',
+		prop=>'info|revisions',
+		intoken=>'block' } );
+	my ($id, $data)=%{$res->{query}->{pages}};
+	my $edittoken=$data->{blocktoken};
+	my $hash = {
+		action=>'block',
+		user=>$user,
+		token=>$edittoken,
+		expiry=>$length,
+		reason=>$summary };
+	$hash->{anononly}=$anononly if ($anononly);
+	$hash->{autoblock}=$autoblock if ($autoblock);
+	$hash->{nocreate}=$blockac if ($blockac);
+	$hash->{noemail}=$blockemail if ($blockemail);
+	$res = $self->{api}->api( $hash );
+
 	return $res;
 }
 
@@ -923,13 +897,18 @@ sub get_users {
 		carp $self->{errstr};
 		return 1;
 	}
-	my $res = $self->{api}->api( {
+	my $hash = {
 		action=>'query',
 		prop=>'revisions',
 		titles=>$pagename,
 		rvprop=>'ids|timestamp|user|comment',
 		rvlimit=>$limit
-	} );
+	};
+
+	$hash->{rvstartid}=$rvstartid if ($rvstartid);
+	$hash->{direction}=$direction if ($direction);
+
+	my $res = $self->{api}->api( $hash );
 	my ($id)=keys %{$res->{query}->{pages}};
 	my $array=$res->{query}->{pages}->{$id}->{revisions};
 	foreach (@{$array}) {
