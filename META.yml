@@ -1,11 +1,11 @@
 --- #YAML:1.0
 name:                Perlwikipedia
-version:             1.3.7
+version:             1.3.8
 abstract:            a Wikipedia bot framework written in Perl
 license:             ~
 author:              
     - Perlwikipedia team
-generated_by:        ExtUtils::MakeMaker version 6.44
+generated_by:        ExtUtils::MakeMaker version 6.42
 distribution_type:   module
 requires:     
     Carp:                          0
