@@ -10,7 +10,7 @@ use Encode;
 use URI::Escape qw(uri_escape_utf8);
 use MediaWiki::API;
 
-our $VERSION = '1.4.2';
+our $VERSION = '1.5.0';
 
 =head1 NAME
 
@@ -357,6 +357,45 @@ sub get_text {
 	return $wikitext;
 }
 
+=item get_pages(@pages)
+
+Returns the text of the specified pages in a hashref. Content of '2' means page does not exist.
+
+=cut
+
+sub get_pages {
+    my $self     = shift;
+    my @pages    = @_;
+    my %return;
+
+	my $hash = {
+		action=>'query',
+		titles=>join('|', @pages),
+		prop=>'revisions',
+		rvprop=>'content',
+	};
+
+#	use Data::Dumper; print Dumper($hash);
+	my $res = $self->{api}->api( $hash );
+#	use Data::Dumper; print Dumper($res);
+	foreach my $id (keys %{$res->{query}->{pages}}) {
+		if (defined($res->{query}->{pages}->{$id}->{missing})) {
+			$return{$res->{query}->{pages}->{$id}->{title}}=
+				2;
+			next;
+		}
+		if (defined($res->{query}->{pages}->{$id}->{revisions})) {
+			my @revisions=@{$res->{query}->{pages}->{$id}->{revisions}};
+			$return{$res->{query}->{pages}->{$id}->{title}}=
+				$revisions[0]->{'*'};
+			next;
+		}
+	}
+
+#	use Data::Dumper;print Dumper(\%return);
+	return \%return;
+}
+
 =item revert($pagename,$edit_summary,$old_revision_id)
 
 Reverts the specified page to $old_revision_id, with an edit summary of $edit_summary.
@@ -678,7 +717,6 @@ sub delete_page {
 	my $page	= shift;
 	my $summary = shift;
 
-
 	my $res = $self->{api}->api( {
 		action=>'query',
 		titles=>$page,
@@ -773,23 +811,28 @@ sub protect {
 	my $self	= shift;
 	my $page	= shift;
 	my $reason	= shift;
-	my $editlvl	= shift;
-	my $movelvl 	= shift;
-	my $time	= shift;
+	my $editlvl	= shift || 'all';
+	my $movelvl 	= shift || 'all';
+	my $time	= shift || 'infinite';
 	my $cascade	= shift;
-	my $res	 = $self->_get( $page, 'protect' );
-	unless ($res) { return; }
-	my $options = {
-		   fields	=> {
-				'mwProtect-level-edit'  => $editlvl,
-				'mwProtect-level-move'  => $movelvl,
-#				'mwProtect-cascade' => $cascade,
-				'mwProtect-expiry' => $time,
-				'mwProtect-reason' => $reason,
-			},
-		};
-	$options->{'mwProtect-cascade'}=$cascade if ($cascade);
-	$res = $self->{mech}->submit_form( %{$options});
+
+	my $res = $self->{api}->api( {
+		action=>'query',
+		titles=>$page,
+		prop=>'info|revisions',
+		intoken=>'protect' } );
+#use Data::Dumper;print STDERR Dumper($res);
+	my ($id, $data)=%{$res->{query}->{pages}};
+	my $edittoken=$data->{protecttoken};
+	$res = $self->{api}->api( {
+		action=>'protect',
+		title=>$page,
+		token=>$edittoken,
+		reason=>$reason,
+		protections=>"edit=$editlvl|move=$movelvl",
+		expiry=>$time,
+		cascade=>$cascade } );
+
 	return $res;
 }
 
@@ -1016,9 +1059,8 @@ sub get_allusers {
 	$limit = 500 unless $limit;
 
 	my $res = $self->{api}->api( { action  =>'query',
-											 meta    =>'siteinfo',
-											 list    =>'allusers',
-											 aulimit => $limit } );
+		 list    =>'allusers',
+		 aulimit => $limit } );
 
 	for my $ref ( @{$res->{query}->{allusers}} ) {
 		push @return, $ref->{name};
