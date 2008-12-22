@@ -10,7 +10,7 @@ use Encode;
 use URI::Escape qw(uri_escape_utf8);
 use MediaWiki::API;
 
-our $VERSION = '1.5.0';
+our $VERSION = '1.5.1';
 
 =head1 NAME
 
@@ -70,8 +70,20 @@ sub new {
     $self->{api}->{config}->{max_lag_retries} = -1;
     $self->{api}->{config}->{retry_delay} = 30;
 
-
     return $self;
+}
+
+=item set_highlimits([$flag])
+
+Tells Perlwikipedia to start using the APIHighLimits for certain queries.
+
+=cut
+
+sub set_highlimits {
+	my $self = shift;
+	my $highlimits = shift;
+	unless (defined($highlimits)) {$highlimits=1}
+	$self->{highlimits}=1;
 }
 
 sub _get {
@@ -198,7 +210,7 @@ sub login {
 		lgpassword=>$password } );
 	use Data::Dumper; print Dumper($res);
 #    unless (ref($res) eq 'HTTP::Response' && $res->is_success) { return; }
-    $self->{mech}->{cookie_jar}->extract_cookies($MediaWiki::API->{response});
+    $self->{mech}->{cookie_jar}->extract_cookies($self->{api}->{response});
     my $result = $res->{login}->{result};
     if ($result eq "Success") {
 	return 0;
@@ -251,11 +263,14 @@ sub edit {
 
 	$res = $self->{api}->api( $savehash );
 #	use Data::Dumper; print Dumper($res);
-	if (!$res) {carp "API returned null result for edit"}
+	if (!$res) {
+		carp "API returned null result or error for edit";
+		carp "Error code: " . $self->{api}->{error}->{code} ."\n";
+		carp $self->{api}->{error}->{details}."\n";
+	}
 	if ($res->{edit}->{result} && $res->{edit}->{result} eq 'Failure') {
-	        print "edit failed as ".$self->{mech}->{agent}."\n";
+	        carp "edit failed as ".$self->{mech}->{agent}."\n";
 		if ($self->{operator}) {
-			print "Operator is $self->{operator}\n";
 			my $optalk=$self->get_text("User talk:".$self->{operator});
 		        unless ($optalk=~/Error with \Q$self->{mech}->{agent}\E/) {
 				print "Sending warning!\n";
@@ -347,6 +362,11 @@ sub get_text {
 	$hash->{rvstartid}=$revid if ($revid);
 
 	my $res = $self->{api}->api( $hash );
+	if (!$res) {
+		carp "API returned null result or error for edit";
+		carp "Error code: " . $self->{api}->{error}->{code} ."\n";
+		carp $self->{api}->{error}->{details}."\n";
+	}
 #	use Data::Dumper; print Dumper($res);
 	my ($id, $data)=%{$res->{query}->{pages}};
 
@@ -377,6 +397,11 @@ sub get_pages {
 
 #	use Data::Dumper; print Dumper($hash);
 	my $res = $self->{api}->api( $hash );
+	if (!$res) {
+		carp "API returned null result or error for edit";
+		carp "Error code: " . $self->{api}->{error}->{code} ."\n";
+		carp $self->{api}->{error}->{details}."\n";
+	}
 #	use Data::Dumper; print Dumper($res);
 	foreach my $id (keys %{$res->{query}->{pages}}) {
 		if (defined($res->{query}->{pages}->{$id}->{missing})) {
@@ -687,22 +712,44 @@ sub test_blocked {
 
 =item test_image_exists($page)
 
-Checks if an image exists at $page. 0 means no, 1 means yes, local, 2 means on commons.
+Checks if an image exists at $page. 0 means no, 1 means yes, local, 2 means on commons, 3 means doesn't exist but there is text on the page.
 
 =cut
 
 sub test_image_exists {
 	my $self	= shift;
-	my $page	= shift;
+	my @pages	= @_;
+	
+	my $titles=join('|', @pages);
+	my $return;
+	$titles=~s/\|{2,}/\|/g;
+	$titles=~s/\|$//;
 
-	my $res = $self->_get($page);
-#	print $res->decoded_content."\n";
-	if ($res->decoded_content=~/No file by this name exists/i) {
-	return 0;
-	} elsif ($res->decoded_content=~/This is a file from the \<a href=.+commons:Main[\s_]Page"\>Wikimedia Commons/is) {
-	return 2;
+	my $hash = {
+		action => 'query',
+		titles => $titles,
+		iilimit => 1,
+		prop => 'imageinfo'};
+
+#	use Data::Dumper; print Dumper($hash);
+	my $res = $self->{api}->api($hash);
+#	use Data::Dumper; print Dumper($res);
+	foreach my $id (keys %{$res->{query}->{pages}}) {
+		my $title=$res->{query}->{pages}->{$id}->{title};
+		if (defined($res->{query}->{pages}->{$id}->{missing}) and $res->{query}->{pages}->{$id}->{imagerepository} eq 'shared') {
+			$return->{$title}=2;
+		} elsif (defined($res->{query}->{pages}->{$id}->{missing})) {
+			$return->{$title}=0;
+		} elsif ($res->{query}->{pages}->{$id}->{imagerepository} eq '') {
+			$return->{$title}=3;
+		} elsif ($res->{query}->{pages}->{$id}->{imagerepository} eq 'local') {
+			$return->{$title}=1;
+		}
+	}
+	if (scalar(@pages)==1) {
+		return $return->{$pages[0]};
 	} else {
-	return 1;
+		return $return;
 	}
 }
 
@@ -815,7 +862,10 @@ sub protect {
 	my $movelvl 	= shift || 'all';
 	my $time	= shift || 'infinite';
 	my $cascade	= shift;
-
+	
+	if ($cascade and ($editlvl ne 'sysop' or $movelvl ne 'sysop')) {
+		carp "Can't set cascading unless both editlvl and movelvl are sysop."
+	}
 	my $res = $self->{api}->api( {
 		action=>'query',
 		titles=>$page,
@@ -824,14 +874,14 @@ sub protect {
 #use Data::Dumper;print STDERR Dumper($res);
 	my ($id, $data)=%{$res->{query}->{pages}};
 	my $edittoken=$data->{protecttoken};
-	$res = $self->{api}->api( {
-		action=>'protect',
+	my $hash={	action=>'protect',
 		title=>$page,
 		token=>$edittoken,
 		reason=>$reason,
 		protections=>"edit=$editlvl|move=$movelvl",
-		expiry=>$time,
-		cascade=>$cascade } );
+		expiry=>$time };
+	$hash->{'cascade'}=$cascade if ($cascade);
+	$res = $self->{api}->api( $hash );
 
 	return $res;
 }
@@ -846,15 +896,19 @@ sub get_pages_in_namespace {
 	my $self = shift;
 	my $namespace = shift;
 	my $page_limit = shift || 500;
+	my $apilimit=500;
+	if ($self->{highlimits}) {
+		$apilimit=5000;
+	}
 
  	my @return;
 	my $max;
 
-	if ($page_limit<=500) {
+	if ($page_limit<=$apilimit) {
 		$max=1;
 	} else {
-		$max=($page_limit-1)/500+1;
-		$page_limit=500;
+		$max=($page_limit-1)/$apilimit+1;
+		$page_limit=$apilimit;
 	}
 
 	my $res = $self->{api}->list( {
