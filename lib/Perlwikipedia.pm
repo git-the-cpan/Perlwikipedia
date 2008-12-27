@@ -1,6 +1,7 @@
 package Perlwikipedia;
 
 use strict;
+use warnings;
 use WWW::Mechanize;
 use HTML::Entities;
 use URI::Escape;
@@ -10,7 +11,16 @@ use Encode;
 use URI::Escape qw(uri_escape_utf8);
 use MediaWiki::API;
 
-our $VERSION = '1.5.1';
+use Module::Pluggable	search_path => [ qw(Perlwikipedia::Plugin) ],
+			'require'   => 1;
+
+foreach my $plugin (__PACKAGE__->plugins) {
+	print "Found plugin $plugin\n";
+	$plugin->import();
+}
+
+
+our $VERSION = '1.5.2';
 
 =head1 NAME
 
@@ -265,11 +275,11 @@ sub edit {
 #	use Data::Dumper; print Dumper($res);
 	if (!$res) {
 		carp "API returned null result or error for edit";
-		carp "Error code: " . $self->{api}->{error}->{code} ."\n";
-		carp $self->{api}->{error}->{details}."\n";
+		carp "Error code: " . $self->{api}->{error}->{code};
+		carp $self->{api}->{error}->{details};
 	}
 	if ($res->{edit}->{result} && $res->{edit}->{result} eq 'Failure') {
-	        carp "edit failed as ".$self->{mech}->{agent}."\n";
+	        carp "edit failed as ".$self->{mech}->{agent};
 		if ($self->{operator}) {
 			my $optalk=$self->get_text("User talk:".$self->{operator});
 		        unless ($optalk=~/Error with \Q$self->{mech}->{agent}\E/) {
@@ -363,9 +373,10 @@ sub get_text {
 
 	my $res = $self->{api}->api( $hash );
 	if (!$res) {
-		carp "API returned null result or error for edit";
-		carp "Error code: " . $self->{api}->{error}->{code} ."\n";
-		carp $self->{api}->{error}->{details}."\n";
+		carp "API returned null result or error for get_text";
+		carp "Error code: " . $self->{api}->{error}->{code};
+		carp $self->{api}->{error}->{details};
+#use Data::Dumper; print Dumper($hash);
 	}
 #	use Data::Dumper; print Dumper($res);
 	my ($id, $data)=%{$res->{query}->{pages}};
@@ -398,9 +409,9 @@ sub get_pages {
 #	use Data::Dumper; print Dumper($hash);
 	my $res = $self->{api}->api( $hash );
 	if (!$res) {
-		carp "API returned null result or error for edit";
-		carp "Error code: " . $self->{api}->{error}->{code} ."\n";
-		carp $self->{api}->{error}->{details}."\n";
+		carp "API returned null result or error for get_pages";
+		carp "Error code: " . $self->{api}->{error}->{code};
+		carp $self->{api}->{error}->{details};
 	}
 #	use Data::Dumper; print Dumper($res);
 	foreach my $id (keys %{$res->{query}->{pages}}) {
@@ -736,7 +747,7 @@ sub test_image_exists {
 #	use Data::Dumper; print Dumper($res);
 	foreach my $id (keys %{$res->{query}->{pages}}) {
 		my $title=$res->{query}->{pages}->{$id}->{title};
-		if (defined($res->{query}->{pages}->{$id}->{missing}) and $res->{query}->{pages}->{$id}->{imagerepository} eq 'shared') {
+		if ($res->{query}->{pages}->{$id}->{imagerepository} eq 'shared') {
 			$return->{$title}=2;
 		} elsif (defined($res->{query}->{pages}->{$id}->{missing})) {
 			$return->{$title}=0;
